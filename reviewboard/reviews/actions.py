@@ -1,96 +1,122 @@
+"""Review request actions."""
+
 from __future__ import unicode_literals
 
-from collections import deque
+from django.utils.translation import ugettext_lazy as _
 
-from django.template.loader import render_to_string
-
-from reviewboard.reviews.errors import DepthLimitExceededError
-
-
-#: The maximum depth limit of any action instance.
-MAX_DEPTH_LIMIT = 2
-
-#: The mapping of all action IDs to their corresponding action instances.
-_all_actions = {}
-
-#: All top-level action IDs (in their left-to-right order of appearance).
-_top_level_ids = deque()
-
-#: Determines if the default action instances have been populated yet.
-_populated = False
+from reviewboard.actions.registry import ActionRegistry
+from reviewboard.actions.base import BaseAction, BaseMenuAction
+from reviewboard.reviews.features import general_comments_feature
+from reviewboard.reviews.models import ReviewRequest
+from reviewboard.site.urlresolvers import local_site_reverse
 
 
-class BaseReviewRequestAction(object):
-    """A base class for an action that can be applied to a review request.
-
-    Creating an action requires subclassing :py:class:`BaseReviewRequestAction`
-    and overriding any fields/methods as desired. Different instances of the
-    same subclass can also override the class fields with their own instance
-    fields.
-
-    Example:
-        .. code-block:: python
-
-           class UsedOnceAction(BaseReviewRequestAction):
-               action_id = 'once'
-               label = 'This is used once.'
-
-           class UsedMultipleAction(BaseReviewRequestAction):
-               def __init__(self, action_id, label):
-                   super(UsedMultipleAction, self).__init__()
-
-                   self.action_id = 'repeat-' + action_id
-                   self.label = 'This is used multiple times,'
-
-    Note:
-        Since the same action will be rendered for multiple different users in
-        a multithreaded environment, the action state should not be modified
-        after initialization. If we want different action attributes at
-        runtime, then we can override one of the getter methods (such as
-        :py:meth:`get_label`), which by default will simply return the original
-        attribute from initialization.
-    """
-
-    #: The ID of this action. Must be unique across all types of actions and
-    #: menu actions, at any depth.
-    action_id = None
-
-    #: The label that displays this action to the user.
-    label = None
-
-    #: The URL to invoke if this action is clicked.
-    url = '#'
-
-    #: Determines if this action should be initially hidden to the user.
-    hidden = False
-
-    def __init__(self):
-        """Initialize this action.
-
-        By default, actions are top-level and have no children.
-        """
-        self._parent = None
-        self._max_depth = 0
-
-    def copy_to_dict(self, context):
-        """Copy this action instance to a dictionary.
-
-        Args:
-            context (django.template.Context):
-                The collection of key-value pairs from the template.
+class ReviewRequestActionRegistry(ActionRegistry):
+    def get_defaults(self):
+        """Return the default review request actions.
 
         Returns:
-            dict: The corresponding dictionary.
+            list of tuple or reviewboard.reviews.actions.ReviewRequestAction:
+            A list of all default review request actions.
         """
-        return {
-            'action_id': self.action_id,
-            'label': self.get_label(context),
-            'url': self.get_url(context),
-            'hidden': self.get_hidden(context),
-        }
+        return [
+            (CloseMenuAction(), (
+                SubmitAction(),
+                DiscardAction(),
+                DeleteAction(),
+            )),
+            (UpdateMenuAction(), (
+                UploadDiffAction(),
+                UploadFileAction(),
+            )),
+            DownloadDiffAction(),
+            EditReviewAction(),
+            AddGeneralCommentAction(),
+            ShipItAction(),
+        ]
+
+
+review_request_actions = ReviewRequestActionRegistry()
+
+
+class ReviewRequestAction(BaseAction):
+    registry = review_request_actions
+
+    template_name = 'reviews/action.html'
+
+
+class ReviewRequestMenuAction(BaseMenuAction):
+    registry = review_request_actions
+
+    template_name = 'reviews/menu_action.html'
+
+
+class CloseMenuAction(ReviewRequestMenuAction):
+    """A menu action for closing the corresponding review request."""
+
+    action_id = 'close-review-request-action'
+    label = _('Close')
+
+    def should_render(self, context):
+        review_request = context['review_request']
+
+        return (review_request.status == ReviewRequest.PENDING_REVIEW and
+                (context['request'].user.pk == review_request.submitter_id or
+                 (context['perms']['reviews']['can_change_status'] and
+                  review_request.public)))
+
+
+class SubmitAction(ReviewRequestAction):
+    """An action for submitting the review request."""
+
+    action_id = 'submit-review-request-action'
+    label = _('Submitted')
+
+    def should_render(self, context):
+        return context['review_request'].public
+
+
+class DiscardAction(ReviewRequestAction):
+    """An action for discarding the review request."""
+
+    action_id = 'discard-review-request-action'
+    label = _('Discarded')
+
+
+class DeleteAction(ReviewRequestAction):
+    """An action for permanently deleting the review request."""
+
+    action_id = 'delete-review-request-action'
+    label = _('Delete Permanently')
+
+    def should_render(self, context):
+        return context['perms']['reviews']['delete_reviewrequest']
+
+
+class UpdateMenuAction(ReviewRequestMenuAction):
+    """A menu action for updating the corresponding review request."""
+
+    action_id = 'update-review-request-action'
+    label = _('Update')
+
+    def should_render(self, context):
+        review_request = context['review_request']
+
+        return (review_request.status == ReviewRequest.PENDING_REVIEW and
+                (context['request'].user.pk == review_request.submitter_id or
+                 context['perms']['reviews']['can_edit_reviewrequest']))
+
+
+class UploadDiffAction(ReviewRequestAction):
+    """An action for updating/uploading a diff for the review request."""
+
+    action_id = 'upload-diff-action'
 
     def get_label(self, context):
         """Return this action's label.
+
+        The label will change depending on whether or not the corresponding
+        review request already has a diff.
 
         Args:
             context (django.template.Context):
@@ -99,7 +125,43 @@ class BaseReviewRequestAction(object):
         Returns:
             unicode: The label that displays this action to the user.
         """
-        return self.label
+        review_request = context['review_request']
+        draft = review_request.get_draft(context['request'].user)
+
+        if (draft and draft.diffset) or review_request.get_diffsets():
+            return _('Update Diff')
+
+        return _('Upload Diff')
+
+    def should_render(self, context):
+        """Return whether or not this action should render.
+
+        If the corresponding review request has a repository, then an upload
+        diff form exists, so we should render this UploadDiffAction.
+
+        Args:
+            context (django.template.Context):
+                The collection of key-value pairs available in the template
+                just before this action is to be rendered.
+
+        Returns:
+            bool: Determines if this action should render.
+        """
+        return context['review_request'].repository_id is not None
+
+
+class UploadFileAction(ReviewRequestAction):
+    """An action for uploading a file for the review request."""
+
+    action_id = 'upload-file-action'
+    label = _('Add File')
+
+
+class DownloadDiffAction(ReviewRequestAction):
+    """An action for downloading a diff from the review request."""
+
+    action_id = 'download-diff-action'
+    label = _('Download Diff')
 
     def get_url(self, context):
         """Return this action's URL.
@@ -111,7 +173,18 @@ class BaseReviewRequestAction(object):
         Returns:
             unicode: The URL to invoke if this action is clicked.
         """
-        return self.url
+        from reviewboard.urls import diffviewer_url_names
+
+        match = context['request'].resolver_match
+
+        # We want to use a relative URL in the diff viewer as we will not be
+        # re-rendering the page when switching between revisions.
+        if match.url_name in diffviewer_url_names:
+            return 'raw/'
+
+        return local_site_reverse('raw-diff', context['request'], kwargs={
+            'review_request_id': context['review_request'].display_id,
+        })
 
     def get_hidden(self, context):
         """Return whether this action should be initially hidden to the user.
@@ -123,12 +196,17 @@ class BaseReviewRequestAction(object):
         Returns:
             bool: Whether this action should be initially hidden to the user.
         """
-        return self.hidden
+        from reviewboard.urls import diffviewer_url_names
+
+        match = context['request'].resolver_match
+
+        if match.url_name in diffviewer_url_names:
+            return match.url_name == 'view-interdiff'
+
+        return super(DownloadDiffAction, self).get_hidden(context)
 
     def should_render(self, context):
         """Return whether or not this action should render.
-
-        The default implementation is to always render the action everywhere.
 
         Args:
             context (django.template.Context):
@@ -138,327 +216,47 @@ class BaseReviewRequestAction(object):
         Returns:
             bool: Determines if this action should render.
         """
-        return True
+        from reviewboard.urls import diffviewer_url_names
 
-    @property
-    def max_depth(self):
-        """Lazily compute the max depth of any action contained by this action.
+        review_request = context['review_request']
+        request = context['request']
+        match = request.resolver_match
 
-        Top-level actions have a depth of zero, and child actions have a depth
-        that is one more than their parent action's depth.
+        # If we're on a diff viewer page, then this DownloadDiffAction should
+        # initially be rendered, but possibly hidden.
+        if match.url_name in diffviewer_url_names:
+            return True
 
-        Algorithmically, the notion of max depth is equivalent to the notion of
-        height in the context of trees (from graph theory). We decided to use
-        this term instead so as not to confuse it with the dimensional height
-        of a UI element.
+        return review_request.repository_id is not None
 
-        Returns:
-            int: The max depth of any action contained by this action.
-        """
-        return self._max_depth
 
-    def reset_max_depth(self):
-        """Reset the max_depth of this action and all its ancestors to zero."""
-        self._max_depth = 0
+class EditReviewAction(ReviewRequestAction):
+    """An action for editing a review intended for the review request."""
 
-        if self._parent:
-            self._parent.reset_max_depth()
+    action_id = 'review-action'
+    label = _('Review')
 
-    def render(self, context, action_key='action',
-               template_name='reviews/action.html'):
-        """Render this action instance and return the content as HTML.
+    def should_render(self, context):
+        return context['request'].user.is_authenticated()
 
-        Args:
-            context (django.template.Context):
-                The collection of key-value pairs that is passed to the
-                template in order to render this action.
 
-            action_key (unicode, optional):
-                The key to be used for this action in the context map.
+class AddGeneralCommentAction(ReviewRequestAction):
+    """An action for adding a new general comment to a review."""
 
-            template_name (unicode, optional):
-                The name of the template to be used for rendering this action.
+    action_id = 'general-comment-action'
+    label = _('Add General Comment')
 
-        Returns:
-            unicode: The action rendered in HTML.
-        """
-        content = ''
+    def should_render(self, context):
+        request = context['request']
+        return (request.user.is_authenticated() and
+                general_comments_feature.is_enabled(request=request))
 
-        if self.should_render(context):
-            context.push()
 
-            try:
-                context[action_key] = self.copy_to_dict(context)
-                content = render_to_string(template_name, context)
-            finally:
-                context.pop()
+class ShipItAction(ReviewRequestAction):
+    """An action for quickly approving the review request without comments."""
 
-        return content
+    action_id = 'ship-it-action'
+    label = _('Ship It!')
 
-    def register(self, parent=None):
-        """Register this review request action instance.
-
-        Note:
-           Newly registered top-level actions are appended to the left of the
-           other previously registered top-level actions. So if we intend to
-           register a collection of top-level actions in a certain order, then
-           we likely want to iterate through the actions in reverse.
-
-        Args:
-            parent (BaseReviewRequestMenuAction, optional):
-                The parent action instance of this action instance.
-
-        Raises:
-            KeyError:
-                A second registration is attempted (action IDs must be unique
-                across all types of actions and menu actions, at any depth).
-
-            DepthLimitExceededError:
-                The maximum depth limit is exceeded.
-        """
-        _populate_defaults()
-
-        if self.action_id in _all_actions:
-            raise KeyError('%s already corresponds to a registered review '
-                           'request action' % self.action_id)
-
-        if self.max_depth > MAX_DEPTH_LIMIT:
-            raise DepthLimitExceededError(self.action_id, MAX_DEPTH_LIMIT)
-
-        if parent:
-            parent.child_actions.append(self)
-            self._parent = parent
-        else:
-            _top_level_ids.appendleft(self.action_id)
-
-        _all_actions[self.action_id] = self
-
-    def unregister(self):
-        """Unregister this review request action instance.
-
-        Note:
-           This method can mutate its parent's child actions. So if we are
-           iteratively unregistering a parent's child actions, then we should
-           consider first making a clone of the list of children.
-
-        Raises:
-            KeyError: An unregistration is attempted before it's registered.
-        """
-        _populate_defaults()
-
-        try:
-            del _all_actions[self.action_id]
-        except KeyError:
-            raise KeyError('%s does not correspond to a registered review '
-                           'request action' % self.action_id)
-
-        if self._parent:
-            self._parent.child_actions.remove(self)
-        else:
-            _top_level_ids.remove(self.action_id)
-
-        self.reset_max_depth()
-
-
-class BaseReviewRequestMenuAction(BaseReviewRequestAction):
-    """A base class for an action with a dropdown menu.
-
-    Note:
-        A menu action's child actions must always be pre-registered.
-    """
-
-    def __init__(self, child_actions=None):
-        """Initialize this menu action.
-
-        Args:
-            child_actions (list of BaseReviewRequestAction, optional):
-                The list of child actions to be contained by this menu action.
-
-        Raises:
-            KeyError:
-                A second registration is attempted (action IDs must be unique
-                across all types of actions and menu actions, at any depth).
-
-            DepthLimitExceededError:
-                The maximum depth limit is exceeded.
-        """
-        super(BaseReviewRequestMenuAction, self).__init__()
-
-        self.child_actions = []
-        child_actions = child_actions or []
-
-        for child_action in child_actions:
-            child_action.register(self)
-
-    def copy_to_dict(self, context):
-        """Copy this menu action instance to a dictionary.
-
-        Args:
-            context (django.template.Context):
-                The collection of key-value pairs from the template.
-
-        Returns:
-            dict: The corresponding dictionary.
-        """
-        dict_copy = {
-            'child_actions': self.child_actions,
-        }
-        dict_copy.update(super(BaseReviewRequestMenuAction, self).copy_to_dict(
-            context))
-
-        return dict_copy
-
-    @property
-    def max_depth(self):
-        """Lazily compute the max depth of any action contained by this action.
-
-        Returns:
-            int: The max depth of any action contained by this action.
-        """
-        if self.child_actions and self._max_depth == 0:
-            self._max_depth = 1 + max(child_action.max_depth
-                                      for child_action in self.child_actions)
-
-        return self._max_depth
-
-    def render(self, context, action_key='menu_action',
-               template_name='reviews/menu_action.html'):
-        """Render this menu action instance and return the content as HTML.
-
-        Args:
-            context (django.template.Context):
-                The collection of key-value pairs that is passed to the
-                template in order to render this menu action.
-
-            action_key (unicode, optional):
-                The key to be used for this menu action in the context map.
-
-            template_name (unicode, optional):
-                The name of the template to be used for rendering this menu
-                action.
-
-        Returns:
-            unicode: The action rendered in HTML.
-        """
-        return super(BaseReviewRequestMenuAction, self).render(
-            context, action_key, template_name)
-
-    def unregister(self):
-        """Unregister this review request action instance.
-
-        This menu action recursively unregisters its child action instances.
-
-        Raises:
-            KeyError: An unregistration is attempted before it's registered.
-        """
-        super(BaseReviewRequestMenuAction, self).unregister()
-
-        # Unregistration will mutate self.child_actions, so we make a copy.
-        for child_action in list(self.child_actions):
-            child_action.unregister()
-
-
-# TODO: Convert all this to use djblets.registries.
-def _populate_defaults():
-    """Populate the default action instances."""
-    global _populated
-
-    if not _populated:
-        _populated = True
-
-        from reviewboard.reviews.default_actions import get_default_actions
-
-        for default_action in reversed(get_default_actions()):
-            default_action.register()
-
-
-def get_top_level_actions():
-    """Return a generator of all top-level registered action instances.
-
-    Yields:
-        BaseReviewRequestAction:
-        All top-level registered review request action instances.
-    """
-    _populate_defaults()
-
-    return (_all_actions[action_id] for action_id in _top_level_ids)
-
-
-def register_actions(actions, parent_id=None):
-    """Register the given actions as children of the corresponding parent.
-
-    If no parent_id is given, then the actions are assumed to be top-level.
-
-    Args:
-        actions (iterable of BaseReviewRequestAction):
-            The collection of action instances to be registered.
-
-        parent_id (unicode, optional):
-            The action ID of the parent of each action instance to be
-            registered.
-
-    Raises:
-        KeyError:
-            The parent action cannot be found or a second registration is
-            attempted (action IDs must be unique across all types of actions
-            and menu actions, at any depth).
-
-        DepthLimitExceededError:
-            The maximum depth limit is exceeded.
-    """
-    _populate_defaults()
-
-    if parent_id is None:
-        parent = None
-    else:
-        try:
-            parent = _all_actions[parent_id]
-        except KeyError:
-            raise KeyError('%s does not correspond to a registered review '
-                           'request action' % parent_id)
-
-    for action in reversed(actions):
-        action.register(parent)
-
-    if parent:
-        parent.reset_max_depth()
-
-
-def unregister_actions(action_ids):
-    """Unregister each of the actions corresponding to the given IDs.
-
-    Args:
-        action_ids (iterable of unicode):
-            The collection of action IDs corresponding to the actions to be
-            removed.
-
-    Raises:
-        KeyError: An unregistration is attempted before it's registered.
-    """
-    _populate_defaults()
-
-    for action_id in action_ids:
-        try:
-            action = _all_actions[action_id]
-        except KeyError:
-            raise KeyError('%s does not correspond to a registered review '
-                           'request action' % action_id)
-
-        action.unregister()
-
-
-def clear_all_actions():
-    """Clear all registered actions.
-
-    This method is really only intended to be used by unit tests. We might be
-    able to remove this hack once we convert to djblets.registries.
-
-    Warning:
-        This will clear **all** actions, even if they were registered in
-        separate extensions.
-    """
-    global _populated
-
-    _all_actions.clear()
-    _top_level_ids.clear()
-    _populated = False
+    def should_render(self, context):
+        return context['request'].user.is_authenticated()

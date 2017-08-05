@@ -44,6 +44,17 @@ User Accounts
    reviewboard.accounts.forms.registration
 
 
+Actions
+=======
+
+.. autosummary::
+   :toctree: python
+
+   reviewboard.actions.base
+   reviewboard.actions.header
+   reviewboard.actions.registry
+
+
 File Attachments
 ================
 
@@ -168,7 +179,6 @@ Review Requests and Reviews
    reviewboard.reviews.actions
    reviewboard.reviews.chunk_generators
    reviewboard.reviews.context
-   reviewboard.reviews.default_actions
    reviewboard.reviews.detail
    reviewboard.reviews.errors
    reviewboard.reviews.fields

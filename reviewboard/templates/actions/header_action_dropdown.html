@@ -1,0 +1,9 @@
+{% load actions djblets_utils i18n staticfiles %}
+<li>
+ <a{% attr "id" %}{{menu.id}}{% endattr %} href="#">{{menu.label}}
+  <span class="rb-icon rb-icon-dropdown-arrow"></span>
+ </a>
+ <ul>
+{% child_actions menu %}
+ </ul>
+</li>

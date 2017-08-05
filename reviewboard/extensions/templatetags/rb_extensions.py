@@ -15,28 +15,14 @@ from reviewboard.site.urlresolvers import local_site_reverse
 register = template.Library()
 
 
-def action_hooks(context, hook_cls, action_key="action",
-                 template_name="extensions/action.html"):
+def action_hooks(context, hook_cls):
     """Displays all registered action hooks from the specified ActionHook."""
     html = []
 
     for hook in hook_cls.hooks:
         try:
-            for actions in hook.get_actions(context):
-                if actions:
-                    context.push()
-                    context[action_key] = actions
-
-                    try:
-                        html.append(render_to_string(template_name, context))
-                    except Exception as e:
-                        logging.error(
-                            'Error when rendering template for action "%s" '
-                            'for hook %r in extension "%s": %s',
-                            action_key, hook, hook.extension.id, e,
-                            exc_info=1)
-
-                    context.pop()
+            for action in hook.get_actions(context):
+                html.append(action.render(context))
         except Exception as e:
             logging.error('Error when running get_actions() on hook %r '
                           'in extension "%s": %s',
@@ -84,10 +70,7 @@ def header_action_hooks(context):
 @register.simple_tag(takes_context=True)
 def header_dropdown_action_hooks(context):
     """Displays all multi-entry action hooks for the header bar."""
-    return action_hooks(context,
-                        HeaderDropdownActionHook,
-                        "actions",
-                        "extensions/header_action_dropdown.html")
+    return action_hooks(context, HeaderDropdownActionHook)
 
 
 @register.simple_tag(takes_context=True)

@@ -7,6 +7,7 @@ from django.core import mail
 from django.template import Context, Template
 from django.test.client import RequestFactory
 from django.utils import six
+from django.utils.six.moves import zip
 from djblets.avatars.tests import DummyAvatarService
 from djblets.extensions.extension import ExtensionInfo
 from djblets.extensions.manager import ExtensionManager
@@ -18,6 +19,7 @@ from djblets.siteconfig.models import SiteConfiguration
 from kgb import SpyAgency
 from mock import Mock
 
+from reviewboard.actions.header import header_actions
 from reviewboard.admin.siteconfig import load_site_config
 from reviewboard.admin.widgets import (primary_widgets,
                                        secondary_widgets,
@@ -27,7 +29,6 @@ from reviewboard.extensions.base import Extension
 from reviewboard.extensions.hooks import (AdminWidgetHook,
                                           APIExtraDataAccessHook,
                                           AvatarServiceHook,
-                                          BaseReviewRequestActionHook,
                                           CommentDetailDisplayHook,
                                           DiffViewerActionHook,
                                           EmailHook,
@@ -47,10 +48,10 @@ from reviewboard.extensions.hooks import (AdminWidgetHook,
                                           WebAPICapabilitiesHook)
 from reviewboard.hostingsvcs.service import (get_hosting_service,
                                              HostingService)
-from reviewboard.reviews.actions import (BaseReviewRequestAction,
-                                         BaseReviewRequestMenuAction,
-                                         clear_all_actions)
 from reviewboard.scmtools.errors import FileNotFoundError
+from reviewboard.reviews.actions import (ReviewRequestAction,
+                                         ReviewRequestMenuAction,
+                                         review_request_actions)
 from reviewboard.reviews.features import ClassBasedActionsFeature
 from reviewboard.reviews.models.review_request import ReviewRequest
 from reviewboard.reviews.fields import (BaseReviewRequestField,
@@ -76,16 +77,17 @@ class ExtensionManagerMixin(object):
 
 class DummyExtension(Extension):
     registration = RegisteredExtension()
+    id = 'reviewboard.extensions.tests.DummyExtension'
 
 
 class ActionHookTests(ExtensionManagerMixin, TestCase):
     """Tests the action hooks in reviewboard.extensions.hooks."""
 
-    class _TestAction(BaseReviewRequestAction):
+    class TestAction(ReviewRequestAction):
         action_id = 'test-action'
         label = 'Test Action'
 
-    class _TestMenuAction(BaseReviewRequestMenuAction):
+    class TestMenuAction(ReviewRequestMenuAction):
         action_id = 'test-menu-instance-action'
         label = 'Menu Instance'
 
@@ -98,7 +100,8 @@ class ActionHookTests(ExtensionManagerMixin, TestCase):
         super(ActionHookTests, self).tearDown()
 
         self.extension.shutdown()
-        clear_all_actions()
+        review_request_actions.reset()
+        header_actions.reset()
 
     def test_review_request_action_hook(self):
         """Testing ReviewRequestActionHook renders on a review request page but
@@ -106,11 +109,11 @@ class ActionHookTests(ExtensionManagerMixin, TestCase):
         """
         with override_feature_check(ClassBasedActionsFeature.feature_id,
                                     enabled=True):
-            self._test_base_review_request_action_hook(
+            self._test_review_request_action_hook(
                 'review-request-detail', ReviewRequestActionHook, True)
-            self._test_base_review_request_action_hook(
+            self._test_review_request_action_hook(
                 'file-attachment', ReviewRequestActionHook, False)
-            self._test_base_review_request_action_hook(
+            self._test_review_request_action_hook(
                 'view-diff', ReviewRequestActionHook, False)
 
     def test_diffviewer_action_hook(self):
@@ -119,11 +122,11 @@ class ActionHookTests(ExtensionManagerMixin, TestCase):
         """
         with override_feature_check(ClassBasedActionsFeature.feature_id,
                                     enabled=True):
-            self._test_base_review_request_action_hook(
+            self._test_review_request_action_hook(
                 'review-request-detail', DiffViewerActionHook, False)
-            self._test_base_review_request_action_hook(
+            self._test_review_request_action_hook(
                 'file-attachment', DiffViewerActionHook, False)
-            self._test_base_review_request_action_hook(
+            self._test_review_request_action_hook(
                 'view-diff', DiffViewerActionHook, True)
 
     def test_review_request_dropdown_action_hook(self):
@@ -145,65 +148,63 @@ class ActionHookTests(ExtensionManagerMixin, TestCase):
             'id': 'missing-url-action',
             'label': 'This action dict is missing a mandatory URL key.',
         }
-        missing_key = 'url'
-        error_message = ('ActionHook-style dicts require a %s key'
-                         % repr(missing_key))
         action_hook_classes = [
-            BaseReviewRequestActionHook,
             ReviewRequestActionHook,
             DiffViewerActionHook,
         ]
 
         for hook_cls in action_hook_classes:
-            with self.assertRaisesMessage(KeyError, error_message):
+            with self.assertRaises(KeyError):
                 hook_cls(extension=self.extension, actions=[
                     missing_url_action,
                 ])
 
     def test_action_hook_init_raises_value_error(self):
-        """Testing that BaseReviewRequestActionHook __init__ raises a
-        ValueError"""
+        """Testing that ReviewRequestActionHook __init__ raises a
+        TypeError
+        """
         unsupported_type_action = [{
             'id': 'unsupported-type-action',
             'label': 'This action is a list, which is an unsupported type.',
             'url': '#',
         }]
-        error_message = ('Only BaseReviewRequestAction and dict instances are '
-                         'supported')
         action_hook_classes = [
-            BaseReviewRequestActionHook,
             ReviewRequestActionHook,
             DiffViewerActionHook,
             ReviewRequestDropdownActionHook,
         ]
 
+        error_msgs = [
+            'Unexpected action "%r"; expected dict or BaseAction',
+            'Unexpected action "%r"; expected dict or BaseAction',
+            'Unexpected action "%r"; expected dict or tuple',
+        ]
+
         with override_feature_check(ClassBasedActionsFeature.feature_id,
                                     enabled=True):
-            for hook_cls in action_hook_classes:
-                with self.assertRaisesMessage(ValueError, error_message):
+            for hook_cls, error_msg in zip(action_hook_classes, error_msgs):
+                error_msg %= unsupported_type_action
+                with self.assertRaisesMessage(TypeError, error_msg):
                     hook_cls(extension=self.extension, actions=[
                         unsupported_type_action,
                     ])
 
     def test_dropdown_action_hook_init_raises_key_error(self):
         """Testing that ReviewRequestDropdownActionHook __init__ raises a
-        KeyError"""
+        KeyError
+        """
         missing_items_menu_action = {
             'id': 'missing-items-menu-action',
             'label': 'This menu action dict is missing a mandatory items key.',
         }
-        missing_key = 'items'
-        error_message = ('ReviewRequestDropdownActionHook-style dicts require '
-                         'a %s key' % repr(missing_key))
 
-        with self.assertRaisesMessage(KeyError, error_message):
+        with self.assertRaises(KeyError):
             ReviewRequestDropdownActionHook(extension=self.extension, actions=[
                 missing_items_menu_action,
             ])
 
-
-    def _test_base_review_request_action_hook(self, url_name, hook_cls,
-                                              should_render):
+    def _test_review_request_action_hook(self, url_name, hook_cls,
+                                         should_render):
         """Test if the action hook renders or not at the given URL.
 
         Args:
@@ -222,7 +223,7 @@ class ActionHookTests(ExtensionManagerMixin, TestCase):
                 'label': 'Yes ID',
                 'url': 'with-id-url',
             },
-            self._TestAction(),
+            self.TestAction(),
             {
                 'label': 'No ID',
                 'url': 'without-id-url',
@@ -233,9 +234,10 @@ class ActionHookTests(ExtensionManagerMixin, TestCase):
             context = self._get_context(url_name=url_name)
             entries = hook.get_actions(context)
             self.assertEqual(len(entries), 3)
-            self.assertEqual(entries[0].action_id, 'with-id-action')
-            self.assertEqual(entries[1].action_id, 'test-action')
-            self.assertEqual(entries[2].action_id, 'no-id-dict-action')
+
+            self.assertEqual(
+                {a.action_id for a in entries},
+                {'with-id-action', 'test-action', 'no-id-action'})
 
             template = Template(
                 '{% load reviewtags %}'
@@ -245,15 +247,9 @@ class ActionHookTests(ExtensionManagerMixin, TestCase):
             self.assertNotIn('action', context)
             self.assertEqual(should_render, 'href="with-id-url"' in content)
             self.assertIn('>Test Action<', content)
-            self.assertEqual(should_render,
-                             'id="no-id-dict-action"' in content)
+            self.assertEqual(should_render, 'id="no-id-action"' in content)
         finally:
             hook.disable_hook()
-
-        content = template.render(context)
-        self.assertNotIn('href="with-id-url"', content)
-        self.assertNotIn('>Test Action<', content)
-        self.assertNotIn('id="no-id-dict-action"', content)
 
     def _test_review_request_dropdown_action_hook(self, url_name, hook_cls,
                                                   should_render):
@@ -270,9 +266,9 @@ class ActionHookTests(ExtensionManagerMixin, TestCase):
                 The expected rendering behaviour.
         """
         hook = hook_cls(extension=self.extension, actions=[
-            self._TestMenuAction([
-                self._TestAction(),
-            ]),
+            (self.TestMenuAction(), (
+                self.TestAction(),
+            )),
             {
                 'id': 'test-menu-dict-action',
                 'label': 'Menu Dict',
@@ -292,10 +288,17 @@ class ActionHookTests(ExtensionManagerMixin, TestCase):
 
         try:
             context = self._get_context(url_name=url_name)
-            entries = hook.get_actions(context)
-            self.assertEqual(len(entries), 2)
-            self.assertEqual(entries[0].action_id, 'test-menu-instance-action')
-            self.assertEqual(entries[1].action_id, 'test-menu-dict-action')
+            self.assertNotIn('action', context)
+
+            self.assertEqual(
+                {e.action_id for e in hook.get_actions(context)},
+                {
+                    'test-menu-dict-action',
+                    'with-id-action',
+                    'no-id-action',
+                    self.TestMenuAction.action_id,
+                    self.TestAction.action_id,
+                })
 
             dropdown_icon_html = \
                 '<span class="rb-icon rb-icon-dropdown-arrow"></span>'
@@ -305,7 +308,6 @@ class ActionHookTests(ExtensionManagerMixin, TestCase):
                 '{% review_request_actions %}'
             )
             content = template.render(context)
-            self.assertNotIn('action', context)
             self.assertInHTML('<a href="#" id="test-action">Test Action</a>',
                               content)
             self.assertInHTML(
@@ -316,7 +318,7 @@ class ActionHookTests(ExtensionManagerMixin, TestCase):
 
             for s in (('id="test-menu-dict-action"',
                        'href="with-id-url"',
-                       'id="no-id-dict-action"')):
+                       'id="no-id-action"')):
                 if should_render:
                     self.assertIn(s, content)
                 else:
@@ -332,37 +334,6 @@ class ActionHookTests(ExtensionManagerMixin, TestCase):
                 self.assertNotIn('Menu Dict', content)
         finally:
             hook.disable_hook()
-
-        content = template.render(context)
-        self.assertNotIn('Test Action', content)
-        self.assertNotIn('Menu Instance', content)
-        self.assertNotIn('id="test-menu-dict-action"', content)
-        self.assertNotIn('href="with-id-url"', content)
-        self.assertNotIn('id="no-id-dict-action"', content)
-
-    def _test_action_hook(self, template_tag_name, hook_cls):
-        action = {
-            'label': 'Test Action',
-            'id': 'test-action',
-            'image': 'test-image',
-            'image_width': 42,
-            'image_height': 42,
-            'url': 'foo-url',
-        }
-
-        hook = hook_cls(extension=self.extension, actions=[action])
-
-        context = Context({})
-        entries = hook.get_actions(context)
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0], action)
-
-        t = Template(
-            "{% load rb_extensions %}"
-            "{% " + template_tag_name + " %}")
-
-        self.assertEqual(t.render(context).strip(),
-                         self._build_action_template(action))
 
     def _test_dropdown_action_hook(self, template_tag_name, hook_cls):
         action = {
@@ -384,13 +355,17 @@ class ActionHookTests(ExtensionManagerMixin, TestCase):
                         actions=[action])
 
         context = Context({})
-        entries = hook.get_actions(context)
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0], action)
+        self.assertEqual(
+            {action.action_id for action in hook.get_actions(context)},
+            {'test-menu', 'test-action'})
 
         t = Template(
-            "{% load rb_extensions %}"
-            "{% " + template_tag_name + " %}")
+            ('{%% load rb_extensions %%}'
+             '{%% %(template_tag_name)s %%}')
+            % {
+                'template_tag_name': template_tag_name,
+            }
+        )
 
         content = t.render(context).strip()
 
@@ -411,7 +386,26 @@ class ActionHookTests(ExtensionManagerMixin, TestCase):
 
     def test_header_hooks(self):
         """Testing HeaderActionHook"""
-        self._test_action_hook('header_action_hooks', HeaderActionHook)
+        action = {
+            'label': 'Test Action',
+            'id': 'test-action',
+            'image': 'test-image',
+            'image_width': 42,
+            'image_height': 42,
+            'url': 'foo-url',
+        }
+
+        HeaderActionHook(extension=self.extension, actions=[action])
+
+        context = Context({})
+
+        t = Template(
+            '{% load rb_extensions %}'
+            '{% header_action_hooks %}'
+        )
+
+        self.assertHTMLEqual(t.render(context).strip(),
+                             self._build_action_template(action))
 
     def test_header_dropdown_action_hook(self):
         """Testing HeaderDropdownActionHook"""

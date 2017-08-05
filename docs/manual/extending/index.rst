@@ -84,9 +84,10 @@ extension hooks available to you.
         Adds a new avatar service, which can be used to provide pictures for
         user accounts.
 
-:ref:`Action Hooks <action-hooks>`:
+**Action Hooks**:
     A series of hooks used to add new actions for review requests, the diff
     viewer, and the account/support header at the top of the page.
+
 
     The following action hooks are available:
 
@@ -106,6 +107,10 @@ extension hooks available to you.
 
     :py:class:`~reviewboard.extensions.hooks.ReviewRequestDropdownActionHook`:
         Adds drop-down actions to the review request actions bar.
+
+    .. seealso::
+
+       Information about writing :ref:`action-hooks`.
 
 **API Hooks:**
     :ref:`webapi-capabilities-hook`:
