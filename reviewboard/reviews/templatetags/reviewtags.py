@@ -21,7 +21,7 @@ from reviewboard.accounts.trophies import UnknownTrophy
 from reviewboard.admin.read_only import is_site_read_only_for
 from reviewboard.deprecation import RemovedInReviewBoard40Warning
 from reviewboard.diffviewer.diffutils import get_displayed_diff_line_ranges
-from reviewboard.reviews.actions import get_top_level_actions
+from reviewboard.reviews.actions import get_review_request_actions
 from reviewboard.reviews.fields import (get_review_request_field,
                                         get_review_request_fieldset,
                                         get_review_request_fieldsets)
@@ -351,36 +351,15 @@ def review_request_actions(context):
         unicode: The HTML content to be rendered.
     """
     content = []
+    request = context['request']
 
-    for top_level_action in get_top_level_actions():
+
+    for root_action in get_review_request_actions().get_root_actions():
         try:
-            content.append(top_level_action.render(context))
+            content.append(root_action.render(request, context))
         except Exception:
             logging.exception('Error rendering top-level action %s',
-                              top_level_action.action_id)
-
-    return ''.join(content)
-
-
-@register.simple_tag(takes_context=True)
-def child_actions(context):
-    """Render all registered child actions.
-
-    Args:
-        context (django.template.Context):
-            The collection of key-value pairs available in the template.
-
-    Returns:
-        unicode: The HTML content to be rendered.
-    """
-    content = []
-
-    for child_action in context['menu_action']['child_actions']:
-        try:
-            content.append(child_action.render(context))
-        except Exception:
-            logging.exception('Error rendering child action %s',
-                              child_action.action_id)
+                              root_action.action_id)
 
     return ''.join(content)
 
