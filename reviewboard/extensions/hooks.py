@@ -7,6 +7,7 @@ import warnings
 from django.template.context import RequestContext
 from django.template.loader import render_to_string
 from django.utils import six
+from django.utils.functional import cached_property
 from djblets.extensions.hooks import (AppliesToURLMixin,
                                       BaseRegistryHook,
                                       BaseRegistryMultiItemHook,
@@ -22,6 +23,9 @@ from djblets.registries.errors import ItemLookupError
 
 from reviewboard.accounts.backends import auth_backends
 from reviewboard.accounts.pages import AccountPage
+from reviewboard.actions.base import BaseAction, MenuActionMixin
+from reviewboard.actions.header import (HeaderAction, HeaderMenuAction,
+                                        get_header_actions)
 from reviewboard.admin.widgets import (register_admin_widget,
                                        unregister_admin_widget)
 from reviewboard.attachments.mimetypes import (register_mimetype_handler,
@@ -30,13 +34,15 @@ from reviewboard.avatars import avatar_services
 from reviewboard.datagrids.grids import (DashboardDataGrid,
                                          UserPageReviewRequestDataGrid)
 from reviewboard.deprecation import RemovedInReviewBoard40Warning
+from reviewboard.extensions.actions import DictActionMixin
 from reviewboard.hostingsvcs.service import (register_hosting_service,
                                              unregister_hosting_service)
 from reviewboard.integrations.base import GetIntegrationManagerMixin
 from reviewboard.notifications.email import (register_email_hook,
                                              unregister_email_hook)
-from reviewboard.reviews.actions import (BaseReviewRequestAction,
-                                         BaseReviewRequestMenuAction)
+from reviewboard.reviews.actions import (ReviewRequestAction,
+                                         ReviewRequestMenuAction,
+                                         get_review_request_actions)
 from reviewboard.reviews.features import class_based_actions_feature
 from reviewboard.reviews.fields import (get_review_request_fieldset,
                                         register_review_request_fieldset,
@@ -837,9 +843,36 @@ class ActionHook(ExtensionHook):
     ``image_height`` (optional):
         The height of the image.
 
-    If our hook needs to access the template context, then it can override
+    If your hook needs to access the template context, then it can override
     :py:meth:`get_actions` and return results from there.
+
+    Deprecated:
+        4.0:
+        This class and dict-based actions are now deprecated. Instead,
+        :py:class:`ReviewRequestActionHook` should be used with a class-based
+        action.
     """
+
+    @property
+    def registry(self):
+        """The registry for the hook.
+
+        Subclasses should override this.
+        """
+        warnings.warn(
+            'ActionHook() is deprecated since Review Board 4.0. '
+            'ReviewRequestActionHook() should be used instead with a '
+            'class-based action.',
+            DeprecationWarning)
+
+        return get_review_request_actions()
+
+    @cached_property
+    def dict_action_class(self):
+        class DictAction(DictActionMixin, self.base_action_class):
+            registry = self.registry
+
+        return DictAction
 
     def initialize(self, actions=None, *args, **kwargs):
         """Initialize this action hook.
@@ -847,7 +880,7 @@ class ActionHook(ExtensionHook):
         Args:
             actions (list, optional):
                 The list of actions (of type :py:class:`dict` or
-                :py:class:`~.actions.BaseReviewRequestAction`) to be added.
+                :py:class:`~reviewboard.actions.base.BaseAction`) to be added.
 
             *args (tuple):
                 Extra positional arguments.
@@ -855,7 +888,28 @@ class ActionHook(ExtensionHook):
             **kwargs (dict):
                 Extra keyword arguments.
         """
-        self.actions = actions or []
+        actions = actions or []
+
+        if (not class_based_actions_feature.is_enabled() and
+            any(not isinstance(action, dict) for action in actions)):
+            logging.error(
+                'The class-based actions API is experimental and may change '
+                'in a future release. It must be enabled before it can be '
+                'used. The actions from %r will not be registered.'
+                % actions)
+
+            actions = []
+
+        actions = [
+            self.normalize_action(action)
+            for action in actions
+        ]
+
+        self.actions = self._register_actions(actions)
+
+    def shutdown(self):
+        for action in reversed(self.actions):
+            self.registry.unregister(action)
 
     def get_actions(self, context):
         """Return the list of action information for this action hook.
@@ -867,123 +921,162 @@ class ActionHook(ExtensionHook):
         Returns:
             list: The list of action information for this action hook.
         """
-        return self.actions
+        return list(self.actions)
 
+    def normalize_action(self, action):
+        """Normalize an action to a class-style action.
 
-class _DictAction(BaseReviewRequestAction):
-    """An action for ActionHook-style dictionaries.
-
-    For backwards compatibility, review request actions may also be supplied as
-    :py:class:`ActionHook`-style dictionaries. This helper class is used by
-    :py:meth:`convert_action` to convert these types of dictionaries into
-    instances of :py:class:`BaseReviewRequestAction`.
-    """
-
-    def __init__(self, action_dict, applies_to):
-        """Initialize this action.
+        Class-style actions will be untouched. Old-style dictionaries will be
+        converted to class-based actions.
 
         Args:
-            action_dict (dict):
-                A dictionary representing this action, as specified by the
-                :py:class:`ActionHook` class.
-
-            applies_to (callable):
-                A callable that examines a given request and determines if this
-                action applies to the page.
-        """
-        super(_DictAction, self).__init__()
-
-        self.label = action_dict['label']
-        self.action_id = action_dict.get(
-            'id',
-            '%s-dict-action' % self.label.lower().replace(' ', '-'))
-        self.url = action_dict['url']
-        self._applies_to = applies_to
-
-    def should_render(self, context):
-        """Return whether or not this action should render.
-
-        Args:
-            context (django.template.Context):
-                The collection of key-value pairs available in the template
-                just before this action is to be rendered.
+            action (dict or reviewboard.actions.base.BaseAction):
+                The action to normalize.
 
         Returns:
-            bool: Determines if this action should render.
+            reviewboard.actions.base.BaseAction:
+            The normalized action.
         """
-        return self._applies_to(context['request'])
+        if isinstance(action, BaseAction):
+            return action
+        elif isinstance(action, dict):
+            for key in ('label', 'url'):
+                if key not in action:
+                    raise KeyError('ActionHook dictionaries require a "%s" key'
+                                   % key)
 
+            return self._action_from_dict(action)
+        else:
+            raise TypeError('Unexpected action "%r"; expected dict or '
+                            'BaseAction'
+                            % action)
 
-class _DictMenuAction(BaseReviewRequestMenuAction):
-    """A menu action for ReviewRequestDropdownActionHook-style dictionaries.
-
-    For backwards compatibility, review request actions may also be supplied as
-    :py:class:`ReviewRequestDropdownActionHook`-style dictionaries. This helper
-    class is used by :py:meth:`convert_action` to convert these types of
-    dictionaries into instances of :py:class:`BaseReviewRequestMenuAction`.
-    """
-
-    def __init__(self, child_actions, action_dict, applies_to):
-        """Initialize this action.
+    def _action_from_dict(self, action):
+        """Convert an action dictionary into a class-based action.
 
         Args:
-            child_actions (list of dict or list of BaseReviewRequestAction):
-                The list of child actions to be contained by this menu action.
-
-            action_dict (dict):
-                A dictionary representing this menu action, as specified by the
-                :py:class:`ReviewRequestDropdownActionHook` class.
-
-            applies_to (callable):
-                A callable that examines a given request and determines if this
-                menu action applies to the page.
-        """
-        super(_DictMenuAction, self).__init__(child_actions)
-
-        self.label = action_dict['label']
-        self.action_id = action_dict.get(
-            'id',
-            '%s-dict-menu-action' % self.label.lower().replace(' ', '-'))
-        self._applies_to = applies_to
-
-    def should_render(self, context):
-        """Return whether or not this action should render.
-
-        Args:
-            context (django.template.Context):
-                The collection of key-value pairs available in the template
-                just before this action is to be rendered.
+            action (dict):
+                A dictionary describing the action.
 
         Returns:
-            bool: Determines if this action should render.
+            reviewboard.actions.base.BaseAction:
+            The action instance.
         """
-        return self._applies_to(context['request'])
+        if isinstance(self, AppliesToURLMixin):
+            return self.dict_action_class(action, self.applies_to)
+        else:
+            return self.dict_action_class(action)
+
+    def _register_actions(self, actions):
+        """Register the given list of review request actions.
+
+        Args:
+            actions (list of reviewboard.actions.base.BaseAction):
+                The actions to register.
+
+        Returns:
+            list of reviewboard.actions.baseAction:
+            The registered actions.
+        """
+        registered_actions = []
+
+        for action in actions:
+            if isinstance(action, tuple):
+                parent, children = action
+                self.registry.register(parent)
+                registered_actions.append(parent)
+
+                for child in children:
+                    self.registry.register(child,
+                                           parent_id=parent.action_id)
+                    registered_actions.append(child)
+            else:
+                assert isinstance(action, BaseAction)
+                self.registry.register(action)
+                registered_actions.append(action)
+
+        return registered_actions
+
+
+class MenuActionHookMixin(object):
+    """An ActionHook mixin for handling menu actions."""
+
+    @cached_property
+    def dict_menu_action_class(self):
+        class DictMenuAction(DictActionMixin, self.base_menu_action_class):
+            registry = self.registry
+
+        return DictMenuAction
+
+    def normalize_action(self, action):
+        """Convert the given dictionary to a menu action and item actions.
+
+        Args:
+            action (dict or tuple):
+                A dictionary representing a review request menu action, as
+                specified by the :py:class:`ReviewRequestDropdownActionHook`
+                class, or a tuple of the action and its child actions.
+
+        Returns:
+            tuple:
+            A 2-tuple of:
+
+            * The menu action.
+            * The list of child actions.
+        """
+        if isinstance(action, tuple):
+            return action
+        elif isinstance(action, dict):
+            for key in ('label', 'items'):
+                if key not in action:
+                    raise KeyError(
+                        'ReviewRequestDropdownActionHook dictionaries '
+                        'require a "%s" key.'
+                        % key)
+
+            return (
+                self._menu_action_from_dict(action),
+                [
+                    super(MenuActionHookMixin, self).normalize_action(child)
+                    for child in action['items']
+                ],
+            )
+        else:
+            raise TypeError('Unexpected action "%r"; expected dict or tuple.'
+                            % action)
+
+    def _menu_action_from_dict(self, action):
+        """Convert an action dictionary into a class-based menu action.
+
+        Args:
+            action (dict):
+                A dictionary describing the action.
+
+        Returns:
+            reviewboard.actions.base.BaseAction:
+            The action instance.
+        """
+        if isinstance(self, AppliesToURLMixin):
+            return self.dict_menu_action_class(action, self.applies_to)
+
+        return self.dict_menu_action_class(action)
 
 
 @six.add_metaclass(ExtensionHookPoint)
-class BaseReviewRequestActionHook(AppliesToURLMixin, ActionHook):
-    """A base hook for adding review request actions to the action bar.
+class ReviewRequestActionHook(AppliesToURLMixin, ActionHook):
+    """A hook for adding review request actions to review request pages.
 
-    Review request actions are displayed on the action bar (alongside default
-    actions such as :guilabel:`Download Diff` and :guilabel:`Ship It!`) of each
-    review request. This action bar is displayed on three main types of pages:
-
-    **Review Request Pages**:
-       Where reviews are displayed.
-
-    **File Attachment Pages**:
-       Where files like screenshots can be reviewed.
-
-    **Diff Viewer Pages**:
-       Where diffs/interdiffs can be viewed side-by-side.
-
-    Each action should be an instance of
-    :py:class:`~reviewboard.reviews.actions.BaseReviewRequestAction` (in
-    particular, each action could be an instance of the subclass
-    :py:class:`~reviewboard.reviews.actions.BaseReviewRequestMenuAction`). For
-    backwards compatibility, actions may also be supplied as
-    :py:class:`ActionHook`-style dictionaries.
+    By default, actions that are passed into this hook will only be displayed
+    on review request pages and not on any file attachment pages or diff
+    viewer pages.
     """
+
+    @property
+    def registry(self):
+        return get_review_request_actions()
+
+    default_apply_to = [main_review_request_url_name]
+    base_action_class = ReviewRequestAction
 
     def initialize(self, actions=None, apply_to=None, *args, **kwargs):
         """Initialize this action hook.
@@ -991,10 +1084,13 @@ class BaseReviewRequestActionHook(AppliesToURLMixin, ActionHook):
         Args:
             actions (list, optional):
                 The list of actions (of type :py:class:`dict` or
-                :py:class:`~.actions.BaseReviewRequestAction`) to be added.
+                :py:class:`~reviewboard.reviews.actions.ReviewRequestAction`)
+                to be added.
 
             apply_to (list of unicode, optional):
                 The list of URL names that this action hook will apply to.
+                By default, this will apply to the main review request page
+                only.
 
             *args (tuple):
                 Extra positional arguments.
@@ -1009,171 +1105,27 @@ class BaseReviewRequestActionHook(AppliesToURLMixin, ActionHook):
 
             ValueError:
                 Some review request action is neither a
-                :py:class:`~.actions.BaseReviewRequestAction` nor a
-                :py:class:`dict` instance.
-        """
-        super(BaseReviewRequestActionHook, self).initialize(
-            apply_to=apply_to or [],
-            *args, **kwargs)
-
-        if actions is None:
-            actions = []
-
-        if (not class_based_actions_feature.is_enabled() and
-            any(not isinstance(action, dict) for action in actions)):
-            logging.error(
-                'The class-based actions API is experimental and will '
-                'change in a future release. It must be enabled before '
-                'it can be used. The actions from %r will not be '
-                'registered.'
-                % self
-            )
-            actions = []
-
-        self.actions = self._register_actions(actions)
-
-    def shutdown(self):
-        """Shutdown the hook and unregister all actions."""
-        for action in self.actions:
-            action.unregister()
-
-    def _register_actions(self, actions):
-        """Register the given list of review request actions.
-
-        Args:
-            actions (list, optional):
-                The list of actions (of type :py:class:`dict` or
-                :py:class:`~.actions.BaseReviewRequestAction`) to be added.
-
-        Returns:
-            list of BaseReviewRequestAction:
-            The list of all registered actions.
-
-        Raises:
-            KeyError:
-                Some dictionary is not an :py:class:`ActionHook`-style
-                dictionary.
-
-            ValueError:
-                Some review request action is neither a
-                :py:class:`~.actions.BaseReviewRequestAction` nor a
-                :py:class:`dict` instance.
-        """
-        registered_actions = []
-
-        # Since newly registered top-level actions are appended to the left of
-        # the other previously registered top-level actions, we must iterate
-        # through the actions in reverse. However, we don't want to mutate the
-        # original actions and we want to preserve the order of the original
-        # actions. Hence, we reverse twice in this method.
-        for action in reversed(actions):
-            action = self._normalize_action(action)
-            action.register()
-            registered_actions.append(action)
-
-        registered_actions.reverse()
-
-        return registered_actions
-
-    def _normalize_action(self, action):
-        """Normalize the given review request action.
-
-        For backwards compatibility, review request actions may also be
-        supplied as :py:class:`ActionHook`-style dictionaries. This helper
-        method normalizes the given review request action so that each review
-        request action is an instance of
-        :py:class:`~.actions.BaseReviewRequestAction`.
-
-        Args:
-            action (dict or BaseReviewRequestAction):
-                The review request action to be normalized.
-
-        Returns:
-            BaseReviewRequestAction: The normalized review request action.
-
-        Raises:
-            KeyError:
-                The given dictionary is not an :py:class:`ActionHook`-style
-                dictionary.
-
-            ValueError:
-                The given review request action is neither a
-                :py:class:`~.actions.BaseReviewRequestAction` nor a
-                :py:class:`dict` instance.
-        """
-        if isinstance(action, BaseReviewRequestAction):
-            return action
-
-        if isinstance(action, dict):
-            return self.convert_action(action)
-
-        raise ValueError('Only BaseReviewRequestAction and dict instances are '
-                         'supported')
-
-    def convert_action(self, action_dict):
-        """Convert the given dictionary to a review request action instance.
-
-        Args:
-            action_dict (dict):
-                A dictionary representing a review request action, as specified
-                by the :py:class:`ActionHook` class.
-
-        Returns:
-            BaseReviewRequestAction:
-            The corresponding review request action instance.
-
-        Raises:
-            KeyError:
-                The given dictionary is not an :py:class:`ActionHook`-style
-                dictionary.
-        """
-        for key in ('label', 'url'):
-            if key not in action_dict:
-                raise KeyError('ActionHook-style dicts require a %s key'
-                               % repr(key))
-
-        return _DictAction(action_dict, self.applies_to)
-
-
-@six.add_metaclass(ExtensionHookPoint)
-class ReviewRequestActionHook(BaseReviewRequestActionHook):
-    """A hook for adding review request actions to review request pages.
-
-    By default, actions that are passed into this hook will only be displayed
-    on review request pages and not on any file attachment pages or diff
-    viewer pages.
-    """
-
-    def initialize(self, actions=None, apply_to=None):
-        """Initialize this action hook.
-
-        Args:
-            actions (list, optional):
-                The list of actions (of type :py:class:`dict` or
-                :py:class:`~.actions.BaseReviewRequestAction`) to be added.
-
-            apply_to (list of unicode, optional):
-                The list of URL names that this action hook will apply to.
-                By default, this will apply to the main review request page
-                only.
-
-        Raises:
-            KeyError:
-                Some dictionary is not an :py:class:`ActionHook`-style
-                dictionary.
-
-            ValueError:
-                Some review request action is neither a
-                :py:class:`~.actions.BaseReviewRequestAction` nor a
-                :py:class:`dict` instance.
+                :py:class:`~reviewboard.reviews.actions.ReviewRequestAction`
+                nor a :py:class:`dict` instance.
         """
         super(ReviewRequestActionHook, self).initialize(
             actions=actions,
-            apply_to=apply_to or [main_review_request_url_name])
+            apply_to=apply_to or self.default_apply_to,
+            *args,
+            **kwargs)
+
+#: An aliased ReviewRequestActionHook for compatability.
+#:
+#: Deprecated:
+#:     4.0:
+#:     ``BaseReviewRequestActionHook`` was renamed to
+#:     :py:class:`ReviewRequestActionHook` in Review Board 4.0.
+BaseReviewRequestActionHook = ReviewRequestActionHook
 
 
 @six.add_metaclass(ExtensionHookPoint)
-class ReviewRequestDropdownActionHook(ReviewRequestActionHook):
+class ReviewRequestDropdownActionHook(MenuActionHookMixin,
+                                      ReviewRequestActionHook):
     """A hook for adding dropdown menu actions to review request pages.
 
     Each menu action should be an instance of
@@ -1210,45 +1162,11 @@ class ReviewRequestDropdownActionHook(ReviewRequestActionHook):
            }]
     """
 
-    def convert_action(self, action_dict):
-        """Convert the given dictionary to a review request action instance.
-
-        Children action dictionaries are recursively converted to action
-        instances.
-
-        Args:
-            action_dict (dict):
-                A dictionary representing a review request menu action, as
-                specified by the :py:class:`ReviewRequestDropdownActionHook`
-                class.
-
-        Returns:
-            BaseReviewRequestMenuAction:
-            The corresponding review request menu action instance.
-
-        Raises:
-            KeyError:
-                The given review request menu action dictionary is not a
-                :py:class:`ReviewRequestDropdownActionHook`-style dictionary.
-        """
-        for key in ('label', 'items'):
-            if key not in action_dict:
-                raise KeyError('ReviewRequestDropdownActionHook-style dicts '
-                               'require a %s key' % repr(key))
-
-        return _DictMenuAction(
-            [
-                super(ReviewRequestDropdownActionHook, self).convert_action(
-                    child_action_dict)
-                for child_action_dict in action_dict['items']
-            ],
-            action_dict,
-            self.applies_to
-        )
+    base_menu_action_class = ReviewRequestMenuAction
 
 
 @six.add_metaclass(ExtensionHookPoint)
-class DiffViewerActionHook(BaseReviewRequestActionHook):
+class DiffViewerActionHook(ReviewRequestActionHook):
     """A hook for adding review request actions to diff viewer pages.
 
     By default, actions that are passed into this hook will only be displayed
@@ -1256,40 +1174,25 @@ class DiffViewerActionHook(BaseReviewRequestActionHook):
     pages.
     """
 
-    def initialize(self, actions=None, apply_to=diffviewer_url_names):
-        """Initialize this action hook.
-
-        Args:
-            actions (list, optional):
-                The list of actions (of type :py:class:`dict` or
-                :py:class:`~.actions.BaseReviewRequestAction`) to be added.
-
-            apply_to (list of unicode, optional):
-                The list of URL names that this action hook will apply to.
-
-        Raises:
-            KeyError:
-                Some dictionary is not an :py:class:`ActionHook`-style
-                dictionary.
-
-            ValueError:
-                Some review request action is neither a
-                :py:class:`~.actions.BaseReviewRequestAction` nor a
-                :py:class:`dict` instance.
-        """
-        super(DiffViewerActionHook, self).initialize(
-            actions,
-            apply_to=apply_to or diffviewer_url_names)
+    default_apply_to = diffviewer_url_names
 
 
 @six.add_metaclass(ExtensionHookPoint)
 class HeaderActionHook(ActionHook):
     """A hook for adding actions to the page header."""
 
+    base_action_class = HeaderAction
+
+    @property
+    def registry(self):
+        return get_header_actions()
+
 
 @six.add_metaclass(ExtensionHookPoint)
-class HeaderDropdownActionHook(ActionHook):
+class HeaderDropdownActionHook(MenuActionHookMixin, HeaderActionHook):
     """A hook for adding dropdown menu actions to the page header."""
+
+    base_menu_action_class = HeaderMenuAction
 
 
 @six.add_metaclass(ExtensionHookPoint)
@@ -1904,6 +1807,7 @@ __all__ = [
     'HeaderDropdownActionHook',
     'HostingServiceHook',
     'IntegrationHook',
+    'MenuActionHookMixin',
     'NavigationBarHook',
     'ReviewRequestActionHook',
     'ReviewRequestApprovalHook',
