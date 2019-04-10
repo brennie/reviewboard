@@ -16,6 +16,8 @@ from django.utils.translation import ugettext_lazy as _
 from djblets.util.compat.django.template.loader import render_to_string
 
 from reviewboard.attachments.models import FileAttachment
+from reviewboard.diffviewer.commit_utils import (CommitHistoryDiffEntry,
+                                                 diff_histories)
 from reviewboard.diffviewer.diffutils import get_sorted_filediffs
 from reviewboard.diffviewer.models import DiffCommit, DiffSet
 from reviewboard.reviews.fields import (BaseCommaEditableField,
@@ -1430,10 +1432,33 @@ class CommitListField(ReviewRequestPageDataMixin, BaseReviewRequestField):
         new_commits = commits[info['new']]
 
         context = self._get_common_context(chain(old_commits, new_commits))
-        context.update({
-            'old_commits': old_commits,
-            'new_commits': new_commits,
-        })
+
+        entry_info = {
+            CommitHistoryDiffEntry.COMMIT_ADDED: ('new-value', '+'),
+            CommitHistoryDiffEntry.COMMIT_REMOVED: ('old-value', '-'),
+            CommitHistoryDiffEntry.COMMIT_MODIFIED: ('changed-value', '~'),
+            CommitHistoryDiffEntry.COMMIT_UNMODIFIED: ('unchanged-value', ''),
+        }
+
+        # Touch up the history entries with some computed values to make
+        # template rendering easier.
+        history = []
+
+        for entry in diff_histories(old_commits, new_commits):
+            row_class, symbol = entry_info[entry.entry_type]
+
+            if entry.entry_type == CommitHistoryDiffEntry.COMMIT_REMOVED:
+                commit = entry.old_commit
+            else:
+                commit = entry.new_commit
+
+            history.append({
+                'row_class': row_class,
+                'symbol': symbol,
+                'commit': commit,
+            })
+
+        context['history'] = history
 
         return render_to_string(
             template_name='reviews/changedesc_commit_list.html',

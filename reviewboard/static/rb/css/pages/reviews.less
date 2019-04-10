@@ -1079,6 +1079,14 @@
       .old-value .marker {
         background: @diff-delete-linenum-color;
       }
+
+      .changed-value .marker {
+        background: @diff-replace-color;
+      }
+
+      .unchanged-value .marker {
+        background: @diff-unchanged-color;
+      }
     }
 
     /* The "Change Summary" section. */
@@ -1180,7 +1188,7 @@
 
       /* The '-' or '+' marker. */
       .marker {
-        background: #F9F9F9;
+        background: @diff-unchanged-color;
         font-family: @textarea-font-family;
         font-size: @textarea-font-size;
         font-weight: bold;

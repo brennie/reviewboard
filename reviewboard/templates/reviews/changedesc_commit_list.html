@@ -1,4 +1,4 @@
-{% load djblets_js i18n %}
+{% load djblets_js djblets_utils i18n %}
 {% comment %}
 This template should be kept in sync with the templates in:
 
@@ -29,39 +29,21 @@ so that they render items identically.
 {% endif %}
   </thead>
   <tbody>
-{% for commit in old_commits %}
-   <tr class="old-value">
-    <td class="marker">-</td>
+{% for entry in history %}
+   <tr{% attr "class" %}{{entry.row_class}}{% endattr %}>
+    <td class="marker">{{entry.symbol}}</td>
 {%  if to_expand %}
-     <td>
-{%   if commit.pk in to_expand %}
-      <a href="#" class="expand-commit-message" data-commit-id="{{commit.pk}}" aria-role="button">
-       <span class="fa fa-plus" title="{% trans "Expand commit message." %}"></span>
-      </a>
-{%    endif %}
-     </td>
+    <td>
+{%   if entry.commit.pk in to_expand %}
+     <a href="#" class="expand-commit-message" data-commit-id="{{entry.commit.pk}}" aria-role="button">
+      <span class="fa fa-plus" title="{% trans "Expand commit message." %}"></span>
+     </a>
+{%   endif %}
+    </td>
 {%  endif %}
-    <td class="value"><pre>{{commit.summary}}</pre></td>
+    <td class="value"><pre>{{entry.commit.summary}}</pre></td>
 {%  if include_author_name %}
-    <td class="value">{{commit.author_name}}</td>
-{%  endif %}
-   </tr>
-{% endfor %}
-{% for commit in new_commits %}
-   <tr class="new-value">
-    <td class="marker">+</td>
-{%  if to_expand %}
-     <td>
-{%   if commit.pk in to_expand %}
-      <a href="#" class="expand-commit-message" data-commit-id="{{commit.pk}}" aria-role="button">
-       <span class="fa fa-plus" title="{% trans "Expand commit message." %}"></span>
-      </a>
-{%    endif %}
-     </td>
-{%  endif %}
-     <td class="value"><pre>{{commit.summary}}</pre></td>
-{%  if include_author_name %}
-    <td class="value">{{commit.author_name}}</td>
+    <td class="value">{{entry.commit.author_name}}</td>
 {%  endif %}
    </tr>
 {% endfor %}

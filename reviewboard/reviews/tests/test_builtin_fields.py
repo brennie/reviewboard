@@ -5,14 +5,17 @@ from __future__ import unicode_literals
 from django.contrib.auth.models import AnonymousUser, User
 from django.core.urlresolvers import resolve
 from django.test.client import RequestFactory
+from kgb import SpyAgency
 
+from reviewboard.diffviewer.commit_utils import (CommitHistoryDiffEntry,
+                                                 diff_histories)
 from reviewboard.reviews.builtin_fields import CommitListField
 from reviewboard.reviews.detail import ReviewRequestPageData
 from reviewboard.reviews.models import ReviewRequestDraft
 from reviewboard.testing.testcase import TestCase
 
 
-class CommitListFieldTests(TestCase):
+class CommitListFieldTests(SpyAgency, TestCase):
     """Unit tests for CommitListField."""
 
     fixtures = ['test_scmtools', 'test_users']
@@ -317,14 +320,14 @@ class CommitListFieldTests(TestCase):
 
         draft_diffset = self.create_diffset(review_request, draft=True)
         self.create_diffcommit(diffset=draft_diffset,
-                               commit_id='r1',
+                               commit_id='r10',
                                parent_id='r0',
                                commit_message='New commit message 1',
                                author_name=author_name)
 
         self.create_diffcommit(diffset=draft_diffset,
-                               commit_id='r2',
-                               parent_id='r1',
+                               commit_id='r20',
+                               parent_id='r10',
                                commit_message='New commit message 2',
                                author_name=author_name)
 
@@ -399,14 +402,14 @@ class CommitListFieldTests(TestCase):
 
         draft_diffset = self.create_diffset(review_request, draft=True)
         self.create_diffcommit(diffset=draft_diffset,
-                               commit_id='r1',
+                               commit_id='r10',
                                parent_id='r0',
                                commit_message='New commit message 1',
                                author_name=author_name)
 
         self.create_diffcommit(diffset=draft_diffset,
-                               commit_id='r2',
-                               parent_id='r1',
+                               commit_id='r20',
+                               parent_id='r10',
                                commit_message='New commit message 2\n\n'
                                               'So very long of a message.\n',
                                author_name=author_name)
@@ -503,14 +506,14 @@ class CommitListFieldTests(TestCase):
 
         draft_diffset = self.create_diffset(review_request, draft=True)
         self.create_diffcommit(diffset=draft_diffset,
-                               commit_id='r1',
+                               commit_id='r10',
                                parent_id='r0',
                                commit_message='New commit message 1',
                                author_name=submitter_name)
 
         self.create_diffcommit(diffset=draft_diffset,
-                               commit_id='r2',
-                               parent_id='r1',
+                               commit_id='r20',
+                               parent_id='r10',
                                commit_message='New commit message 2\n\n'
                                               'So very long of a message.\n',
                                author_name=submitter_name)
@@ -612,14 +615,14 @@ class CommitListFieldTests(TestCase):
 
         draft_diffset = self.create_diffset(review_request, draft=True)
         self.create_diffcommit(diffset=draft_diffset,
-                               commit_id='r1',
+                               commit_id='r10',
                                parent_id='r0',
                                commit_message='New commit message 1',
                                author_name=submitter_name)
 
         self.create_diffcommit(diffset=draft_diffset,
-                               commit_id='r2',
-                               parent_id='r1',
+                               commit_id='r20',
+                               parent_id='r10',
                                commit_message='New commit message 2',
                                author_name=submitter_name)
 
@@ -699,14 +702,14 @@ class CommitListFieldTests(TestCase):
 
         draft_diffset = self.create_diffset(review_request, draft=True)
         self.create_diffcommit(diffset=draft_diffset,
-                               commit_id='r1',
+                               commit_id='r10',
                                parent_id='r0',
                                commit_message='New commit message 1',
                                author_name=submitter_name)
 
         self.create_diffcommit(diffset=draft_diffset,
-                               commit_id='r2',
-                               parent_id='r1',
+                               commit_id='r20',
+                               parent_id='r10',
                                commit_message='New commit message 2',
                                author_name='Example Author')
 
@@ -757,6 +760,169 @@ class CommitListFieldTests(TestCase):
             ' </tr>'
             '</tbody>'
             % {'name': submitter_name},
+            result)
+
+    def test_render_change_entry_html_some_unmodified(self):
+        """Testing CommitListField.render_change_entry_html with some
+        unmodified commits
+        """
+        target = User.objects.get(username='doc')
+        repository = self.create_repository(tool_name='Git')
+        review_request = self.create_review_request(repository=repository,
+                                                    target_people=[target],
+                                                    public=True,
+                                                    create_with_history=True)
+        diffset = self.create_diffset(review_request)
+
+        submitter_name = review_request.submitter.get_full_name()
+
+        self.create_diffcommit(diffset=diffset,
+                               commit_id='r1',
+                               parent_id='r0',
+                               commit_message='Unchanged commit',
+                               author_name=submitter_name)
+        self.create_diffcommit(diffset=diffset,
+                               commit_id='r2',
+                               parent_id='r1',
+                               commit_message='Old commit',
+                               author_name=submitter_name)
+
+        draft_diffset = self.create_diffset(review_request, draft=True)
+        self.create_diffcommit(diffset=draft_diffset,
+                               commit_id='r1',
+                               parent_id='r0',
+                               commit_message='Unchanged commit',
+                               author_name=submitter_name)
+        self.create_diffcommit(diffset=draft_diffset,
+                               commit_id='r20',
+                               parent_id='r1',
+                               commit_message='New commit',
+                               author_name=submitter_name)
+
+        draft_diffset.finalize_commit_series(
+            cumulative_diff=self.DEFAULT_GIT_FILEDIFF_DATA_DIFF,
+            validation_info=None,
+            validate=False,
+            save=True)
+
+        review_request.publish(user=review_request.submitter)
+        changedesc = review_request.changedescs.latest()
+
+        field = self._make_field(review_request)
+        result = field.render_change_entry_html(
+            changedesc.fields_changed[field.field_id])
+
+        self.assertInHTML('<colgroup><col><col></colgroup>', result)
+        self.assertInHTML(
+            '<thead>'
+            ' <tr>'
+            '  <th class="marker"></th>'
+            '  <th>Summary</th>'
+            ' </tr>'
+            '</thead>',
+            result)
+        self.assertInHTML(
+            '<tbody>'
+            ' <tr>'
+            '  <td class="marker"></td>'
+            '  <td class="value"><pre>Unchanged commit</pre></td>'
+            ' </tr>'
+            ' <tr class="old-value">'
+            '  <td class="marker">-</td>'
+            '  <td class="value"><pre>Old commit</pre></td>'
+            ' </tr>'
+            ' <tr class="new-value">'
+            '  <td class="marker">+</td>'
+            '  <td class="value"><pre>New commit</pre></td>'
+            ' </tr>'
+            '</tbody>',
+            result)
+
+    def test_render_change_entry_html_modified(self):
+        """Testing CommitListField.render_change_entry_html with some
+        unmodified commits
+        """
+        target = User.objects.get(username='doc')
+        repository = self.create_repository(tool_name='Git')
+        review_request = self.create_review_request(repository=repository,
+                                                    target_people=[target],
+                                                    public=True,
+                                                    create_with_history=True)
+        diffset = self.create_diffset(review_request)
+
+        submitter_name = review_request.submitter.get_full_name()
+
+        self.create_diffcommit(diffset=diffset,
+                               commit_id='r1',
+                               parent_id='r0',
+                               commit_message='Changed commit 1',
+                               author_name=submitter_name)
+        self.create_diffcommit(diffset=diffset,
+                               commit_id='r2',
+                               parent_id='r1',
+                               commit_message='Changed commit 2',
+                               author_name=submitter_name)
+
+        draft_diffset = self.create_diffset(review_request, draft=True)
+        self.create_diffcommit(diffset=draft_diffset,
+                               commit_id='r1',
+                               parent_id='r0',
+                               commit_message='Changed commit 1',
+                               author_name=submitter_name)
+        self.create_diffcommit(diffset=draft_diffset,
+                               commit_id='r2',
+                               parent_id='r1',
+                               commit_message='Changed commit 2',
+                               author_name=submitter_name)
+
+        draft_diffset.finalize_commit_series(
+            cumulative_diff=self.DEFAULT_GIT_FILEDIFF_DATA_DIFF,
+            validation_info=None,
+            validate=False,
+            save=True)
+
+        review_request.publish(user=review_request.submitter)
+        changedesc = review_request.changedescs.latest()
+
+        # TODO: diff_histories is very simple and doesn't currently support
+        #       detecting modified commits.
+        def _diff_histories(old, new):
+            return [
+                CommitHistoryDiffEntry(
+                    entry_type=CommitHistoryDiffEntry.COMMIT_MODIFIED,
+                    old_commit=old[0],
+                    new_commit=new[0]),
+                CommitHistoryDiffEntry(
+                    entry_type=CommitHistoryDiffEntry.COMMIT_MODIFIED,
+                    old_commit=old[1],
+                    new_commit=new[1]),
+            ]
+
+        self.spy_on(diff_histories, call_fake=_diff_histories)
+
+        field = self._make_field(review_request)
+        result = field.render_change_entry_html(
+            changedesc.fields_changed[field.field_id])
+
+        self.assertInHTML('<colgroup><col><col></colgroup>', result)
+        self.assertInHTML(
+            '<thead>'
+            ' <tr>'
+            '  <th class="marker"></th>'
+            '  <th>Summary</th>'
+            ' </tr>'
+            '</thead>',
+            result)
+        self.assertInHTML(
+            '<tbody>'
+            ' <tr class="changed-value">'
+            '  <td class="marker">~</td>'
+            '  <td class="value"><pre>Changed commit 1</pre></td>'
+            ' </tr>'
+            ' <tr class="changed-value">'
+            '  <td class="marker">~</td>'
+            '  <td class="value"><pre>Changed commit 2</pre></td>'
+            ' </tr>',
             result)
 
     def test_serialize_change_entry(self):
